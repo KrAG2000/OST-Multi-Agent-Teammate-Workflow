@@ -1,0 +1,89 @@
+# Default: Postgres + scheduler + Telegram bot, using an Ollama that already runs on the host.
+# On a server without Ollama, add COMPOSE_PROFILES=ollama to .env to run it in a container
+# and set OLLAMA_BASE_URL=http://ollama:11434. With a hosted LLM (Groq/OpenAI/Anthropic) you
+# only need Ollama for embeddings, or set EMBEDDINGS_PROVIDER=openai.
+
+x-app: &app
+  build: .
+  image: postpilot:latest
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql://postpilot:${POSTGRES_PASSWORD:-postpilot}@db:5432/postpilot
+  volumes:
+    - ./config:/app/config:ro,z        # edit platforms.yaml without rebuilding
+    - ./knowledge:/app/knowledge:ro,z  # drop notes here; synced before each daily run
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  depends_on:
+    db:
+      condition: service_healthy
+    ollama-pull:
+      condition: service_completed_successfully
+      required: false
+
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postpilot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postpilot}
+      POSTGRES_DB: postpilot
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${DB_HOST_PORT:-5433}:5432"  # localhost only; for running the CLI on the host
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postpilot -d postpilot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  scheduler:
+    <<: *app
+    command: ["scheduler"]
+
+  bot:
+    <<: *app
+    command: ["bot"]
+    restart: on-failure  # exits cleanly when TELEGRAM_BOT_TOKEN is unset
+
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    restart: unless-stopped
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    # Uncomment for an NVIDIA GPU (needs nvidia-container-toolkit):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        [ "$${LLM_PROVIDER:-ollama}" = ollama ] && ollama pull "$${LLM_MODEL}"
+        [ "$${EMBEDDINGS_PROVIDER:-ollama}" = ollama ] && ollama pull "$${EMBEDDINGS_MODEL}"
+        exit 0
+    env_file: .env
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  ollama:
