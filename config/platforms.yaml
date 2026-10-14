@@ -1,0 +1,83 @@
+# One entry per channel. Add any platform by copying a block; the key is its id
+# (used in Telegram commands, e.g. /ideas linkedin). Edits apply on the next run.
+#
+# image.sizes: the writer must pick exactly one label per post; the prompt it
+# writes is composed for that resolution and aspect ratio.
+
+platforms:
+  instagram:
+    display_name: Instagram
+    enabled: true
+    purpose: >
+      Casual, personal posts: life as a developer, desk setups, small wins,
+      learning moments, hobby projects. Human first, tech second.
+    audience: Friends, peers and people curious about a developer's day-to-day.
+    tone: Casual, warm, light humour, a few emojis at most. Never corporate.
+    format: caption
+    length: {min_words: 40, max_words: 150, max_chars: 2200}
+    hashtags: {min: 5, max: 12}
+    image:
+      required: true
+      sizes:
+        - {label: portrait_4_5, width: 1080, height: 1350, use_for: "default feed post, most screen space"}
+        - {label: square_1_1, width: 1080, height: 1080, use_for: "quotes, simple graphics, carousels"}
+        - {label: story_9_16, width: 1080, height: 1920, use_for: "story or reel cover, vertical scenes"}
+    rules:
+      - First line must work as a hook before the "more" cut-off.
+      - Hashtags go only in the hashtags field, never in the caption body.
+
+  linkedin:
+    display_name: LinkedIn
+    enabled: true
+    purpose: >
+      Technical and professional posts: engineering lessons, system design,
+      AI/agents, career takeaways from real projects.
+    audience: Software engineers, tech leads and recruiters.
+    tone: Clear, confident, practical. Opinionated but not preachy. No buzzword soup.
+    format: post
+    length: {min_words: 120, max_words: 300, max_chars: 3000}
+    hashtags: {min: 3, max: 5}
+    image:
+      required: true
+      sizes:
+        - {label: landscape_1_91, width: 1200, height: 627, aspect: "1.91:1", use_for: "diagrams, banners, link-style visuals"}
+        - {label: square_1_1, width: 1080, height: 1080, use_for: "single concept or quote cards"}
+        - {label: portrait_4_5, width: 1080, height: 1350, use_for: "infographics, checklists"}
+    rules:
+      - Hook in the first two lines; short paragraphs; no markdown headings.
+      - End with a concrete takeaway or a genuine question.
+
+  medium:
+    display_name: Medium
+    enabled: true
+    purpose: >
+      In-depth technical articles and tutorials: how something works, how I
+      built it, trade-offs, with code where it helps.
+    audience: Developers who want depth and working examples.
+    tone: Explanatory, friendly, precise. Show, don't hand-wave.
+    format: article
+    length: {min_words: 800, max_words: 1600}
+    hashtags: {min: 3, max: 5}  # used as Medium topics/tags
+    image:
+      required: true
+      sizes:
+        - {label: cover_16_9, width: 1400, height: 788, aspect: "16:9", use_for: "article header image"}
+    rules:
+      - Markdown with H2 sections, an intro that states the problem, and a conclusion.
+      - Use fenced code blocks for code; keep snippets runnable and short.
+
+  # Example of adding another platform. Set enabled: true to use it.
+  x:
+    display_name: X (Twitter)
+    enabled: false
+    purpose: Short technical observations and links to my articles.
+    tone: Punchy and direct.
+    format: thread
+    length: {max_words: 200}
+    hashtags: {min: 0, max: 2}
+    image:
+      required: false
+      sizes:
+        - {label: landscape_16_9, width: 1600, height: 900, use_for: "single image post"}
+    rules:
+      - Each part of the thread must be under 280 characters.
