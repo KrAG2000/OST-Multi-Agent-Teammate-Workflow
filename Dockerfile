@@ -15,4 +15,4 @@ RUN useradd --create-home app && chown -R app /app
 USER app
 
 ENTRYPOINT ["python", "-m", "postpilot"]
-CMD ["scheduler"]
+CMD ["worker"]

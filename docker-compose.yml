@@ -1,4 +1,5 @@
-# Default: Postgres + scheduler + Telegram bot, using an Ollama that already runs on the host.
+# Default: Postgres + worker + Telegram bot, using an Ollama that already runs on the host.
+# Exactly one worker processes the shared queue; never scale it above 1 (it refuses to start twice).
 # On a server without Ollama, add COMPOSE_PROFILES=ollama to .env to run it in a container
 # and set OLLAMA_BASE_URL=http://ollama:11434. With a hosted LLM (Groq/OpenAI/Anthropic) you
 # only need Ollama for embeddings, or set EMBEDDINGS_PROVIDER=openai.
@@ -40,9 +41,9 @@ services:
       timeout: 5s
       retries: 20
 
-  scheduler:
+  worker:
     <<: *app
-    command: ["scheduler"]
+    command: ["worker"]
 
   bot:
     <<: *app
