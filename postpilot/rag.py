@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
+from postpilot import quota
 from postpilot.config import get_settings
 from postpilot.db import connect
 from postpilot.llm import get_embeddings
@@ -40,8 +41,18 @@ def chunk_text(text: str, size: int = 1200, overlap: int = 150) -> list[str]:
     return chunks
 
 
-def add_document(kind: str, source: str, text: str, platform: str | None = None) -> int:
-    """Store `text` under `source`, replacing older content from that source.
+def _embed_documents(texts: list[str]) -> list[list[float]]:
+    quota.charge("embed_requests")
+    return get_embeddings().embed_documents(texts)
+
+
+def _embed_query(text: str) -> list[float]:
+    quota.charge("embed_requests")
+    return get_embeddings().embed_query(text)
+
+
+def add_document(user_id: int, kind: str, source: str, text: str, platform: str | None = None) -> int:
+    """Store `text` under the user's `source`, replacing older content from that source.
 
     Returns the number of chunks written (0 when the content is unchanged).
     """
@@ -51,39 +62,50 @@ def add_document(kind: str, source: str, text: str, platform: str | None = None)
     content_hash = hashlib.sha256(text.encode()).hexdigest()
     with connect() as conn:
         exists = conn.execute(
-            "SELECT 1 FROM documents WHERE source = %s AND content_hash = %s LIMIT 1",
-            (source, content_hash),
+            "SELECT 1 FROM documents WHERE user_id = %s AND source = %s AND content_hash = %s LIMIT 1",
+            (user_id, source, content_hash),
         ).fetchone()
         if exists:
             return 0
 
     chunks = chunk_text(text)
-    vectors = get_embeddings().embed_documents(chunks)
+    vectors = _embed_documents(chunks)
     with connect() as conn:
-        conn.execute("DELETE FROM documents WHERE source = %s", (source,))
+        conn.execute("DELETE FROM documents WHERE user_id = %s AND source = %s", (user_id, source))
         for i, (chunk, vec) in enumerate(zip(chunks, vectors, strict=True)):
             conn.execute(
-                "INSERT INTO documents (kind, platform, source, content_hash, chunk_index, "
-                "content, embedding) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                (kind, platform, source, content_hash, i, chunk, np.array(vec)),
+                "INSERT INTO documents (user_id, kind, platform, source, content_hash, chunk_index, "
+                "content, embedding) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (user_id, kind, platform, source, content_hash, i, chunk, np.array(vec)),
             )
     log.info("indexed %s (%d chunks)", source, len(chunks))
     return len(chunks)
 
 
-def sync_knowledge_dir(path: Path | None = None) -> int:
-    """Index every .md/.txt file under the knowledge folder. Unchanged files are skipped."""
+def knowledge_files(path: Path | None = None) -> list[Path]:
     root = path or get_settings().knowledge_dir
     if not root.exists():
-        return 0
-    written = 0
-    for file in sorted(root.rglob("*")):
-        if file.is_file() and file.suffix.lower() in KNOWLEDGE_SUFFIXES and file.name != "README.md":
-            written += add_document("knowledge", f"file:{file.relative_to(root)}", file.read_text())
-    return written
+        return []
+    return [
+        f for f in sorted(root.rglob("*"))
+        if f.is_file() and f.suffix.lower() in KNOWLEDGE_SUFFIXES and f.name != "README.md"
+    ]
+
+
+def sync_knowledge_dir(user_id: int, path: Path | None = None) -> int:
+    """Index every .md/.txt file under the knowledge folder for a user (the admin).
+
+    Unchanged files are skipped.
+    """
+    root = path or get_settings().knowledge_dir
+    return sum(
+        add_document(user_id, "knowledge", f"file:{f.relative_to(root)}", f.read_text())
+        for f in knowledge_files(root)
+    )
 
 
 def search(
+    user_id: int,
     query: str,
     kinds: tuple[str, ...] = ("knowledge", "post"),
     platform: str | None = None,
@@ -91,12 +113,12 @@ def search(
 ) -> list[dict]:
     """Cosine-similarity search. `platform` limits to that platform plus untagged docs."""
     k = k or get_settings().rag_top_k
-    vec = np.array(get_embeddings().embed_query(query))
+    vec = np.array(_embed_query(query))
     with connect() as conn:
         return conn.execute(
             "SELECT content, source, kind, platform, 1 - (embedding <=> %(v)s) AS score "
-            "FROM documents WHERE kind = ANY(%(kinds)s) "
+            "FROM documents WHERE user_id = %(u)s AND kind = ANY(%(kinds)s) "
             "AND (%(p)s::text IS NULL OR platform IS NULL OR platform = %(p)s) "
             "ORDER BY embedding <=> %(v)s LIMIT %(k)s",
-            {"v": vec, "kinds": list(kinds), "p": platform, "k": k},
+            {"u": user_id, "v": vec, "kinds": list(kinds), "p": platform, "k": k},
         ).fetchall()
