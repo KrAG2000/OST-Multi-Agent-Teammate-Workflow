@@ -7,8 +7,9 @@ import logging
 import smtplib
 import ssl
 from email.message import EmailMessage
+from email.utils import formataddr
 
-from postpilot import render, store
+from postpilot import quota, render, store
 from postpilot.config import get_settings
 
 log = logging.getLogger(__name__)
@@ -41,21 +42,25 @@ def _html(drafts: list[dict]) -> str:
     )
 
 
-def send_digest() -> int:
-    """Email pending, not-yet-mailed drafts. Returns how many were sent."""
+def recipients(user: dict) -> list[str]:
+    return [x.strip() for x in (user.get("email_to") or "").split(",") if x.strip()]
+
+
+def send_digest(user: dict) -> int:
+    """Email the user's pending, not-yet-mailed drafts. Returns how many were sent."""
     s = get_settings()
-    if not s.email_enabled:
-        log.info("email not configured; skipping digest")
+    to = recipients(user)
+    if not (s.smtp_configured and to):
         return 0
-    drafts = store.drafts_to_email()
+    drafts = store.drafts_to_email(user["id"])
     if not drafts:
-        log.info("no new drafts to email")
         return 0
 
+    quota.charge("emails", len(to))  # refused before sending if today's email limit is reached
     msg = EmailMessage()
-    msg["Subject"] = f"Your post drafts for {s.today():%a %d %b} ({len(drafts)})"
-    msg["From"] = s.email_from or s.smtp_user
-    msg["To"] = ", ".join(s.email_recipients)
+    msg["Subject"] = f"Your post drafts for {drafts[-1]['run_date']:%a %d %b} ({len(drafts)})"
+    msg["From"] = formataddr(("PostPilot", s.email_from))
+    msg["To"] = ", ".join(to)
     msg.set_content("\n\n" + ("\n\n" + "=" * 60 + "\n\n").join(render.full_text(d) for d in drafts))
     msg.add_alternative(_html(drafts), subtype="html")
 
@@ -72,5 +77,5 @@ def send_digest() -> int:
         server.send_message(msg)
 
     store.mark_emailed([d["id"] for d in drafts])
-    log.info("emailed %d drafts to %s", len(drafts), msg["To"])
+    log.info("emailed %d drafts to user %s", len(drafts), user["id"])
     return len(drafts)
