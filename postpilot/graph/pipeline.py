@@ -5,6 +5,8 @@ Platform team: START -> [ensure_backlog -> pick_idea] -> retrieve -> write <-> c
 
 Runs are checkpointed in Postgres, so a run that crashes halfway (model timeout,
 container restart) resumes where it stopped instead of redoing finished platforms.
+Everything is scoped to one user, and platforms run one at a time (max_concurrency=1)
+so a run never makes concurrent model calls.
 """
 
 from __future__ import annotations
@@ -13,6 +15,8 @@ import logging
 import operator
 import time
 from collections.abc import Iterator
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from contextlib import contextmanager
 from typing import Annotated, Literal
 
@@ -22,18 +26,21 @@ from langgraph.types import RetryPolicy, Send
 from typing_extensions import NotRequired, TypedDict
 
 from postpilot import rag, store
-from postpilot.config import enabled_platforms, get_settings, load_platforms
+from postpilot.config import get_settings
+from postpilot.quota import CapacityError
 from postpilot.graph import agents
 
 log = logging.getLogger(__name__)
 
-LLM_RETRY = RetryPolicy(max_attempts=3, initial_interval=5.0)
+# Retry flaky model calls, but never a quota refusal: that must stop the run.
+LLM_RETRY = RetryPolicy(max_attempts=3, initial_interval=5.0, retry_on=lambda e: not isinstance(e, CapacityError))
 
 
 # --- state -------------------------------------------------------------------
 
 
 class PlatformState(TypedDict):
+    user_id: int
     platform: str
     run_date: str
     idea: NotRequired[dict]
@@ -53,6 +60,7 @@ class PlatformOutput(TypedDict):
 
 
 class PipelineState(TypedDict):
+    user_id: int
     run_date: str
     platforms: list[str]
     drafts: Annotated[list[dict], operator.add]
@@ -61,33 +69,40 @@ class PipelineState(TypedDict):
 # --- platform team nodes -----------------------------------------------------
 
 
-def _steering(platform: str) -> list[str]:
-    return [s["directive"] for s in store.active_steering(platform)]
+def _steering(user_id: int, platform: str) -> list[str]:
+    return [s["directive"] for s in store.active_steering(user_id, platform)]
 
 
-def refill_ideas(platform: str, n: int | None = None) -> list[int]:
-    """Ideation agent: add `n` AI suggestions to the platform's backlog."""
+def _platform(user_id: int, name: str):
+    platform = store.load_platforms(user_id).get(name)
+    if platform is None:
+        raise ValueError(f"unknown platform '{name}'")
+    return platform
+
+
+def refill_ideas(user_id: int, platform: str, n: int | None = None) -> list[int]:
+    """Ideation agent: add `n` AI suggestions to the user's backlog for a platform."""
     s = get_settings()
-    p = load_platforms()[platform]
-    steering = _steering(platform)
+    p = _platform(user_id, platform)
+    steering = _steering(user_id, platform)
     query = " ".join([p.purpose, *steering, *p.seed_topics])
-    knowledge = [d["content"] for d in rag.search(query, kinds=("knowledge",), k=8)]
+    knowledge = [d["content"] for d in rag.search(user_id, query, kinds=("knowledge",), k=8)]
     ideas = agents.generate_ideas(
-        p, n or s.idea_batch_size, steering, store.recent_titles(platform), knowledge
+        p, n or s.idea_batch_size, steering, store.recent_titles(user_id, platform), knowledge
     )
-    ids = store.add_ideas(platform, [i.model_dump() for i in ideas], source="ai")
+    ids = store.add_ideas(user_id, platform, [i.model_dump() for i in ideas], source="ai")
     log.info("%s: added %d idea suggestions", platform, len(ids))
     return ids
 
 
 def ensure_backlog(state: PlatformState) -> dict:
-    if len(store.open_ideas(state["platform"])) < get_settings().idea_backlog_min:
-        refill_ideas(state["platform"])
+    if len(store.open_ideas(state["user_id"], state["platform"])) < get_settings().idea_backlog_min:
+        refill_ideas(state["user_id"], state["platform"])
     return {}
 
 
 def pick_idea(state: PlatformState) -> dict:
-    idea = store.next_idea(state["platform"])
+    idea = store.next_idea(state["user_id"], state["platform"])
     if idea is None:
         raise RuntimeError(f"no ideas available for {state['platform']}")
     return {"idea": {"id": idea["id"], "title": idea["title"], "angle": idea["angle"]}}
@@ -96,15 +111,15 @@ def pick_idea(state: PlatformState) -> dict:
 def retrieve(state: PlatformState) -> dict:
     idea = state["idea"]
     query = f"{idea['title']}. {idea.get('angle', '')}"
-    knowledge = rag.search(query, kinds=("knowledge",))
-    past = rag.search(query, kinds=("post",), platform=state["platform"], k=3)
+    knowledge = rag.search(state["user_id"], query, kinds=("knowledge",))
+    past = rag.search(state["user_id"], query, kinds=("post",), platform=state["platform"], k=3)
     context = [f"[note: {d['source']}]\n{d['content']}" for d in knowledge]
     context += [f"[past {state['platform']} post, for voice only]\n{d['content']}" for d in past]
-    return {"context": context, "steering": _steering(state["platform"])}
+    return {"context": context, "steering": _steering(state["user_id"], state["platform"])}
 
 
 def write(state: PlatformState) -> dict:
-    p = load_platforms()[state["platform"]]
+    p = _platform(state["user_id"], state["platform"])
     revising = "critique" in state
     draft = agents.write_draft(
         p,
@@ -119,7 +134,7 @@ def write(state: PlatformState) -> dict:
 
 
 def critique(state: PlatformState) -> dict:
-    p = load_platforms()[state["platform"]]
+    p = _platform(state["user_id"], state["platform"])
     review = agents.critique_draft(p, state["draft"], state.get("context", []))
     hard = agents.rule_violations(p, state["draft"])
     score = max(1, min(10, review.score))
@@ -136,6 +151,7 @@ def after_critique(state: PlatformState) -> Literal["write", "save"]:
 
 def save(state: PlatformState) -> dict:
     draft_id = store.save_draft(
+        user_id=state["user_id"],
         run_date=state["run_date"],
         platform=state["platform"],
         idea_id=state["idea"].get("id"),
@@ -174,14 +190,17 @@ def build_platform_graph() -> StateGraph:
 
 
 def plan(state: PipelineState) -> dict:
-    enabled = enabled_platforms()
+    enabled = store.enabled_platforms(state["user_id"])
     chosen = [p for p in state.get("platforms") or enabled if p in enabled]
     log.info("run %s: platforms %s", state["run_date"], chosen)
     return {"platforms": chosen}
 
 
 def fan_out(state: PipelineState) -> list[Send]:
-    return [Send("platform", {"platform": p, "run_date": state["run_date"], "drafts": []}) for p in state["platforms"]]
+    return [
+        Send("platform", {"user_id": state["user_id"], "platform": p, "run_date": state["run_date"], "drafts": []})
+        for p in state["platforms"]
+    ]
 
 
 def build_pipeline(checkpointer=None):
@@ -203,14 +222,18 @@ def checkpointer() -> Iterator[PostgresSaver]:
 def _config(thread_id: str) -> dict:
     return {
         "configurable": {"thread_id": thread_id},
-        "max_concurrency": get_settings().max_parallel_platforms,
+        "max_concurrency": 1,  # one model call at a time, always
     }
 
 
-def run_daily(force: bool = False) -> list[dict]:
-    """The scheduled run: one thread per day, resumed if a previous attempt failed midway."""
-    today = get_settings().today().isoformat()
-    thread_id = f"daily-{today}"
+def user_today(user: dict) -> str:
+    return datetime.now(ZoneInfo(user["timezone"])).date().isoformat()
+
+
+def run_daily(user: dict, force: bool = False) -> list[dict]:
+    """A user's scheduled run: one thread per day, resumed if a previous attempt failed midway."""
+    today = user_today(user)
+    thread_id = f"daily-{user['id']}-{today}"
     with checkpointer() as cp:
         graph = build_pipeline(cp)
         snapshot = graph.get_state(_config(thread_id))
@@ -222,28 +245,29 @@ def run_daily(force: bool = False) -> list[dict]:
             return snapshot.values.get("drafts", [])
         if snapshot.values:
             thread_id = f"{thread_id}-{int(time.time())}"
-        inputs = {"run_date": today, "platforms": [], "drafts": []}
+        inputs = {"user_id": user["id"], "run_date": today, "platforms": [], "drafts": []}
         return graph.invoke(inputs, _config(thread_id))["drafts"]
 
 
-def run_now(platforms: list[str] | None = None) -> list[dict]:
-    """Ad-hoc run (CLI / Telegram /run), always a fresh thread."""
-    today = get_settings().today().isoformat()
+def run_now(user: dict, platforms: list[str] | None = None) -> list[dict]:
+    """Ad-hoc run (/run), always a fresh thread."""
+    today = user_today(user)
     with checkpointer() as cp:
         graph = build_pipeline(cp)
-        inputs = {"run_date": today, "platforms": platforms or [], "drafts": []}
-        return graph.invoke(inputs, _config(f"manual-{today}-{int(time.time())}"))["drafts"]
+        inputs = {"user_id": user["id"], "run_date": today, "platforms": platforms or [], "drafts": []}
+        return graph.invoke(inputs, _config(f"manual-{user['id']}-{today}-{int(time.time())}"))["drafts"]
 
 
-def regenerate(draft_id: int, feedback: str = "") -> dict:
+def regenerate(user: dict, draft_id: int, feedback: str = "") -> dict:
     """Re-run one platform team on an existing draft's idea, with the owner's feedback."""
-    old = store.get_draft(draft_id)
+    old = store.get_draft(user["id"], draft_id)
     if old is None:
         raise ValueError(f"draft #{draft_id} not found")
-    idea = store.get_idea(old["idea_id"]) if old["idea_id"] else None
+    idea = store.get_idea(user["id"], old["idea_id"]) if old["idea_id"] else None
     inputs: PlatformState = {
+        "user_id": user["id"],
         "platform": old["platform"],
-        "run_date": get_settings().today().isoformat(),
+        "run_date": user_today(user),
         "idea": {
             "id": old["idea_id"],
             "title": idea["title"] if idea else old["title"],
@@ -256,5 +280,5 @@ def regenerate(draft_id: int, feedback: str = "") -> dict:
     }
     with checkpointer() as cp:
         graph = build_platform_graph().compile(checkpointer=cp)
-        result = graph.invoke(inputs, _config(f"regen-{draft_id}-{int(time.time())}"))
+        result = graph.invoke(inputs, _config(f"regen-{user['id']}-{draft_id}-{int(time.time())}"))
     return result["drafts"][0]
