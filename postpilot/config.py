@@ -10,7 +10,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,20 +36,34 @@ class Settings(BaseSettings):
     platforms_file: Path = Path("config/platforms.yaml")
     knowledge_dir: Path = Path("knowledge")
 
+    # Defaults for new users; each user can change their own with /time and /timezone.
     timezone: str = "UTC"
-    generate_cron: str = "0 6 * * *"
-    email_cron: str = "0 8 * * *"
-    run_on_startup: bool = False
+    generate_time: str = "06:00"
 
     max_revisions: int = 2
     min_critic_score: int = 7
     idea_backlog_min: int = 3
     idea_batch_size: int = 5
     rag_top_k: int = 5
-    max_parallel_platforms: int = 2
 
     telegram_bot_token: str = ""
-    telegram_allowed_chat_ids: str = ""  # comma-separated
+    # Admins: always allowed, no invite needed, own the knowledge/ folder. Comma-separated.
+    telegram_admin_chat_ids: str = Field(
+        "", validation_alias=AliasChoices("telegram_admin_chat_ids", "telegram_allowed_chat_ids")
+    )
+    invite_code: str = ""  # if set, new users must send /start <code>
+    max_users: int = 0  # 0 = no cap
+
+    # Daily limits (reset at 00:00 UTC), shared by all users. Set them to what your free
+    # tiers allow; 0 = unlimited. Jobs are refused once any limit would be exceeded.
+    quota_llm_requests_per_day: int = 300
+    quota_llm_tokens_per_day: int = 1_500_000
+    quota_embed_requests_per_day: int = 2000
+    quota_emails_per_day: int = 400  # Gmail allows ~500/day
+    quota_jobs_per_day: int = 60
+    quota_jobs_per_user_per_day: int = 6
+    llm_requests_per_minute: int = 0  # throttle for per-minute provider limits; 0 = none
+    est_tokens_per_llm_request: int = 6000  # reserved per call until the real count is known
 
     # "gmail" fills in Gmail's server settings; "smtp" uses SMTP_HOST etc. as given.
     email_provider: Literal["gmail", "smtp"] = "smtp"
@@ -59,8 +73,9 @@ class Settings(BaseSettings):
     smtp_password: str = ""
     smtp_starttls: bool = True
     smtp_ssl: bool = False
+    # Only needed for custom SMTP whose login isn't an email address (e.g. Amazon SES keys).
     email_from: str = ""
-    email_to: str = ""  # comma-separated
+    email_to: str = ""  # default email for admins; other users set theirs with /email
 
     @model_validator(mode="after")
     def _apply_email_provider(self) -> Settings:
@@ -78,17 +93,23 @@ class Settings(BaseSettings):
         return datetime.now(self.tz).date()
 
     @property
-    def allowed_chat_ids(self) -> set[int]:
-        return {int(x) for x in _split(self.telegram_allowed_chat_ids)}
+    def admin_chat_ids(self) -> set[int]:
+        return {int(x) for x in _split(self.telegram_admin_chat_ids)}
 
     @property
-    def email_recipients(self) -> list[str]:
-        return _split(self.email_to)
-
-    @property
-    def email_enabled(self) -> bool:
+    def smtp_configured(self) -> bool:
         creds_ok = self.email_provider != "gmail" or bool(self.smtp_user and self.smtp_password)
-        return bool(self.smtp_host and self.email_recipients and creds_ok)
+        return bool(self.smtp_host and self.email_from and creds_ok)
+
+    @property
+    def quota_limits(self) -> dict[str, int]:
+        return {
+            "llm_requests": self.quota_llm_requests_per_day,
+            "llm_tokens": self.quota_llm_tokens_per_day,
+            "embed_requests": self.quota_embed_requests_per_day,
+            "emails": self.quota_emails_per_day,
+            "jobs": self.quota_jobs_per_day,
+        }
 
 
 def _split(value: str) -> list[str]:
@@ -151,14 +172,10 @@ class Platform(BaseModel):
     seed_topics: list[str] = []
 
 
-def load_platforms(path: Path | None = None) -> dict[str, Platform]:
-    """Read platform profiles. Not cached, so YAML edits apply on the next run."""
+def load_platform_templates(path: Path | None = None) -> dict[str, Platform]:
+    """Platform templates from YAML. New users start with a copy; each user then owns theirs."""
     path = path or get_settings().platforms_file
     raw = yaml.safe_load(path.read_text()) or {}
     return {
         name: Platform(name=name, **cfg) for name, cfg in (raw.get("platforms") or {}).items()
     }
-
-
-def enabled_platforms() -> dict[str, Platform]:
-    return {k: v for k, v in load_platforms().items() if v.enabled}
