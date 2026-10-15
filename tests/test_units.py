@@ -1,4 +1,5 @@
-from postpilot.config import Settings, load_platforms
+from postpilot.config import Settings
+from postpilot.config import load_platform_templates as load_platforms
 from postpilot.graph.agents import DraftOut, ImageOut, normalize_draft, rule_violations
 from postpilot.rag import chunk_text
 
@@ -59,13 +60,17 @@ def test_rule_violations():
 
 def test_email_provider_presets():
     gmail = Settings(_env_file=None, email_provider="gmail", smtp_host="ignored", smtp_port=25,
-                     smtp_user="me@gmail.com", smtp_password="app-pass", email_to="a@x.com, b@x.com")
+                     smtp_user="me@gmail.com", smtp_password="app-pass")
     assert (gmail.smtp_host, gmail.smtp_port, gmail.smtp_starttls) == ("smtp.gmail.com", 587, True)
-    assert gmail.email_from == "me@gmail.com" and gmail.email_enabled
-    assert gmail.email_recipients == ["a@x.com", "b@x.com"]
-    assert not Settings(_env_file=None, email_provider="gmail", email_to="a@x.com").email_enabled
+    assert gmail.email_from == "me@gmail.com" and gmail.smtp_configured
+    assert not Settings(_env_file=None, email_provider="gmail").smtp_configured
 
-    custom = Settings(_env_file=None, email_provider="smtp", smtp_host="smtp.brevo.com", smtp_port=465,
-                      smtp_ssl=True, email_from="news@me.dev", email_to="a@x.com")
-    assert (custom.smtp_host, custom.smtp_port, custom.smtp_ssl) == ("smtp.brevo.com", 465, True)
-    assert custom.email_from == "news@me.dev" and custom.email_enabled
+    custom = Settings(_env_file=None, email_provider="smtp", smtp_host="email-smtp.eu-west-1.amazonaws.com",
+                      smtp_port=465, smtp_ssl=True, smtp_user="AKIAKEY", email_from="news@me.dev")
+    assert (custom.smtp_port, custom.smtp_ssl, custom.email_from) == (465, True, "news@me.dev")
+    assert custom.smtp_configured
+
+
+def test_admin_ids_accept_old_variable_name():
+    s = Settings(_env_file=None, telegram_allowed_chat_ids="11, 22")
+    assert s.admin_chat_ids == {11, 22}
