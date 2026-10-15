@@ -10,6 +10,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel
 
+from postpilot import quota
 from postpilot.config import get_settings
 
 T = TypeVar("T", bound=BaseModel)
@@ -44,11 +45,18 @@ def get_embeddings() -> Embeddings:
 
 
 def ask_structured(schema: type[T], system: str, user: str, temperature: float | None = None) -> T:
-    """One LLM call that must return `schema`. Raises so node retry policies can kick in."""
-    model = get_chat_model(temperature).with_structured_output(schema)
-    result = model.invoke([SystemMessage(system), HumanMessage(user)])
+    """One metered LLM call that must return `schema`. Raises so node retry policies can kick in."""
+    s = get_settings()
+    quota.ensure_room("llm_tokens", s.est_tokens_per_llm_request)
+    quota.charge("llm_requests")  # refused here, before the call, if today's limit is reached
+    quota.throttle_llm()
+    model = get_chat_model(temperature).with_structured_output(schema, include_raw=True)
+    out = model.invoke([SystemMessage(system), HumanMessage(user)])
+    usage = getattr(out["raw"], "usage_metadata", None) or {}
+    quota.charge("llm_tokens", usage.get("total_tokens") or s.est_tokens_per_llm_request, after_the_fact=True)
+    result = out["parsed"]
     if result is None:
-        raise ValueError(f"model returned no {schema.__name__}")
+        raise ValueError(f"model returned no {schema.__name__}: {out.get('parsing_error')}")
     if isinstance(result, dict):
         result = schema.model_validate(result)
     return result
